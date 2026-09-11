@@ -17,6 +17,94 @@ struct AppEntry: Identifiable, Hashable {
     var id: String { bundleID }
 }
 
+/// The daemon logs an app's *name*, not its bundle ID — and that name is the bundle's
+/// filename without ".app". So an exact filename match against the standard app
+/// directories recovers the ID, including for apps that are no longer running. Doing it
+/// here rather than changing the log format keeps the daemon untouched while it is under
+/// dry-run observation.
+enum AppIndex {
+    private static var cache: [String: String]?
+
+    static func bundleID(forName name: String) -> String? {
+        if cache == nil { build() }
+        return cache?[name]
+    }
+
+    static func invalidate() { cache = nil }
+
+    private static func build() {
+        var map: [String: String] = [:]
+        for a in NSWorkspace.shared.runningApplications {
+            guard let id = a.bundleIdentifier, let url = a.bundleURL else { continue }
+            map[url.deletingPathExtension().lastPathComponent] = id
+        }
+        let fm = FileManager.default
+        for dir in ["/Applications", "/Applications/Utilities",
+                    "/System/Applications", "/System/Applications/Utilities",
+                    NSHomeDirectory() + "/Applications"] {
+            guard let names = try? fm.contentsOfDirectory(atPath: dir) else { continue }
+            for n in names where n.hasSuffix(".app") {
+                let stem = String(n.dropLast(4))
+                guard map[stem] == nil,
+                      let b = Bundle(url: URL(fileURLWithPath: dir).appendingPathComponent(n)),
+                      let id = b.bundleIdentifier else { continue }
+                map[stem] = id
+            }
+        }
+        cache = map
+    }
+}
+
+/// One parsed log line. The log is the only record of what the daemon decided, so the
+/// summary is built by reading it back rather than by keeping a second copy of the truth.
+struct ActivityEntry: Identifiable {
+    enum Kind { case wouldQuit, quit, veto, standDown, lifecycle, chatter }
+
+    let id = UUID()
+    let time: String
+    let app: String?
+    let kind: Kind
+    let line: String
+
+    var isDecision: Bool { kind == .wouldQuit || kind == .quit }
+
+    static func parse(_ line: String) -> ActivityEntry? {
+        guard line.hasPrefix("["), let close = line.firstIndex(of: "]") else { return nil }
+        let time = String(line[line.index(after: line.startIndex)..<close])
+        var rest = String(line[line.index(after: close)...]).trimmingCharacters(in: .whitespaces)
+
+        // "Safari: last window closed" has an app; "config reloaded — …" does not.
+        var app: String?
+        if let colon = rest.firstIndex(of: ":") {
+            let candidate = String(rest[..<colon])
+            if !candidate.contains("—") {
+                app = candidate
+                rest = String(rest[rest.index(after: colon)...])
+                    .trimmingCharacters(in: .whitespaces)
+            }
+        }
+
+        let kind: Kind
+        if rest.contains("WOULD QUIT") { kind = .wouldQuit }
+        else if rest.contains("last window closed") { kind = .quit }
+        else if rest.contains("not quitting") { kind = .veto }
+        else if rest.contains("standing down") { kind = .standDown }
+        else if app == nil { kind = .lifecycle }
+        else { kind = .chatter }
+
+        return ActivityEntry(time: time, app: app, kind: kind, line: line)
+    }
+}
+
+/// One app's worth of dry-run history — the "what would have happened" row.
+struct AppSummary: Identifiable {
+    let app: String
+    let bundleID: String?
+    let decisions: Int
+    let lastSeen: String
+    var id: String { app }
+}
+
 /// What the daemon writes to `~/.config/closequit/status.json` every few seconds.
 /// Checking that a process merely exists is not enough: a daemon parked in the
 /// Accessibility wait loop is running and doing nothing, and looks identical.
@@ -78,8 +166,9 @@ final class Model: ObservableObject {
     @Published var apps: [AppEntry] = []
     @Published var search = ""
     @Published var newPattern = ""
-    @Published var activity: [String] = []
+    @Published var entries: [ActivityEntry] = []
     @Published var quitsOnly = false
+    @Published var activityMode = 0   // 0 = summary, 1 = raw log
     @Published var status: DaemonStatus?
     @Published var launchAgentInstalled = false
     @Published var grantedNow = false
@@ -194,21 +283,37 @@ final class Model: ObservableObject {
     /// Tail the log rather than reading it whole — it is append-only and can grow
     /// unbounded, and only the recent end is ever interesting.
     func refreshActivity() {
-        guard let h = try? FileHandle(forReadingFrom: Model.logURL) else { activity = []; return }
+        guard let h = try? FileHandle(forReadingFrom: Model.logURL) else { entries = []; return }
         defer { try? h.close() }
-        let window: UInt64 = 64 * 1024
+        let window: UInt64 = 256 * 1024
         let size = (try? h.seekToEnd()) ?? 0
         let truncated = size > window
         try? h.seek(toOffset: truncated ? size - window : 0)
         let text = String(decoding: (try? h.readToEnd()) ?? Data(), as: UTF8.self)
         var lines = text.split(separator: "\n").map(String.init)
         if truncated, !lines.isEmpty { lines.removeFirst() }   // half a line
-        activity = Array(lines.suffix(400)).reversed()          // newest first
+        entries = lines.reversed().compactMap(ActivityEntry.parse)   // newest first
     }
 
-    var visibleActivity: [String] {
-        guard quitsOnly else { return activity }
-        return activity.filter { $0.contains("QUIT") || $0.contains("quitting") }
+    var visibleLog: [ActivityEntry] {
+        Array((quitsOnly ? entries.filter(\.isDecision) : entries).prefix(400))
+    }
+
+    /// "What would have happened", which is the question a dry run is actually asking.
+    /// Reading it off seven scattered log lines is how the Messages misconfiguration
+    /// went unnoticed; as a ranked count it is the first thing you see.
+    var summary: [AppSummary] {
+        var counts: [String: (n: Int, last: String)] = [:]
+        for e in entries where e.isDecision {
+            guard let app = e.app else { continue }
+            if var hit = counts[app] { hit.n += 1; counts[app] = hit }
+            else { counts[app] = (1, e.time) }   // newest-first, so first sighting is latest
+        }
+        return counts.map {
+            AppSummary(app: $0.key, bundleID: AppIndex.bundleID(forName: $0.key),
+                       decisions: $0.value.n, lastSeen: $0.value.last)
+        }
+        .sorted { $0.decisions == $1.decisions ? $0.app < $1.app : $0.decisions > $1.decisions }
     }
 
     /// Pick up edits made in a text editor, unless we are the ones mid-write.
@@ -478,28 +583,106 @@ struct SettingsView: View {
     private var activityTab: some View {
         VStack(spacing: 0) {
             HStack {
-                Toggle("Quits only", isOn: $model.quitsOnly).toggleStyle(.switch)
+                Picker("", selection: $model.activityMode) {
+                    Text("Summary").tag(0)
+                    Text("Log").tag(1)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+
+                if model.activityMode == 1 {
+                    Toggle("Decisions only", isOn: $model.quitsOnly).toggleStyle(.checkbox)
+                }
                 Spacer()
                 Text("~/Library/Logs/closequit.log").font(.caption).foregroundStyle(.secondary)
             }
             .padding(12)
 
-            if model.visibleActivity.isEmpty {
-                VStack(spacing: 6) {
-                    Text("Nothing logged yet.").foregroundStyle(.secondary)
-                    Text("Decisions are always logged. Turn on Verbose to see per-tick counts.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if model.entries.isEmpty {
+                emptyActivity
+            } else if model.activityMode == 0 {
+                summaryList
             } else {
-                List(Array(model.visibleActivity.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(line.contains("QUIT") || line.contains("quitting")
-                                         ? Color.primary : Color.secondary)
-                        .textSelection(.enabled)
-                }
+                logList
             }
+        }
+    }
+
+    private var emptyActivity: some View {
+        VStack(spacing: 6) {
+            Text("Nothing logged yet.").foregroundStyle(.secondary)
+            Text("Decisions are always logged. Turn on Verbose to see per-tick counts.")
+                .font(.callout).foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder private var summaryList: some View {
+        let rows = model.summary
+        if rows.isEmpty {
+            VStack(spacing: 6) {
+                Text("No quit decisions yet.").foregroundStyle(.secondary)
+                Text("The daemon is watching, but nothing has closed its last window so far.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                Text("\(rows.count) app\(rows.count == 1 ? "" : "s") would have been quit "
+                     + "· \(rows.reduce(0) { $0 + $1.decisions }) decisions in the recent log")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .padding(.horizontal, 12).padding(.bottom, 8)
+
+                List(rows) { row in summaryRow(row) }
+            }
+        }
+    }
+
+    private func summaryRow(_ row: AppSummary) -> some View {
+        HStack(spacing: 8) {
+            if let id = row.bundleID, let icon = Model.icon(for: id) {
+                Image(nsImage: icon).resizable().frame(width: 20, height: 20)
+            } else {
+                Image(systemName: "questionmark.app.dashed").frame(width: 20, height: 20)
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.app)
+                Text(row.bundleID ?? "couldn't resolve a bundle id for this name")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            VStack(alignment: .trailing, spacing: 1) {
+                Text("\(row.decisions)×").monospacedDigit()
+                Text("last \(row.lastSeen)").font(.caption).foregroundStyle(.secondary)
+            }
+
+            // The loop the dry run is for: see it here, act on it here.
+            if let id = row.bundleID {
+                if model.lockingPattern(id) != nil {
+                    Text("by rule").font(.caption).foregroundStyle(.secondary)
+                        .frame(width: 118, alignment: .trailing)
+                } else if model.isManaged(id) {
+                    Button("Stop watching") { model.setManaged(id, false) }
+                        .frame(width: 118)
+                } else {
+                    Text("not watched").font(.caption).foregroundStyle(.secondary)
+                        .frame(width: 118, alignment: .trailing)
+                }
+            } else {
+                Text("—").foregroundStyle(.secondary).frame(width: 118, alignment: .trailing)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var logList: some View {
+        List(model.visibleLog) { e in
+            Text(e.line)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(e.isDecision ? Color.primary : Color.secondary)
+                .textSelection(.enabled)
         }
     }
 

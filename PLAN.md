@@ -129,8 +129,9 @@ Everything here is a few lines and needs no UI.
 ## Remaining work
 
 1. Rerun the live matrix: VS Code, After Effects, Preview, Finder, Safari, Photoshop.
-2. Re-measure the daemon's real footprint — the 2.9 MB figure predates Config.swift
-   and hot-reload. Nothing new is linked, so it should hold, but it is unconfirmed.
+2. ~~Re-measure the daemon's real footprint.~~ Done: **4.9 MB** `phys_footprint` after
+   8 minutes installed, 0.1% CPU. Against 2.9 MB at start / 4.5 MB steady from the
+   original v2 measurement — so the steady figure held and the table above stands.
 3. Add idle quit + pause.
 4. Log rotation, and evict `identities` for pids that leave the watchlist.
 5. Run with `dryRun: true` for a week. Read the Activity tab. Ship only when it's boring.
@@ -182,6 +183,23 @@ untrusted, which looked like proof the permission was fine. It was not: TCC attr
 a request to the **responsible process**, and for a binary exec'd from a shell that is
 the terminal. The test was reading the terminal's grant. Judge the daemon only by
 `axTrusted` in `status.json`, never by running the binary by hand.
+
+## Working during a dry-run observation window
+
+The two binaries being independent turns out to be a scheduling property as well as a
+memory one. While the daemon is under observation:
+
+- **Do not touch the daemon.** Changing the engine mid-evaluation invalidates the
+  evaluation, and a restart wipes the in-memory guard state — every app has to
+  re-earn `trustworthy`.
+- **The settings app is free to change.** `./build.sh settings` rebuilds only that
+  bundle, so a running daemon is never replaced or restarted. Verified: same pid,
+  uninterrupted uptime, across repeated settings builds.
+- **Config edits are free too.** They hot-reload, so fixing exclusions costs the
+  observation nothing.
+
+This is why the Activity summary was built before idle quit and pause, which are
+daemon changes and belong in one batch after the window closes.
 
 ## Notes on SmartClose
 
