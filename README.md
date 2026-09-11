@@ -49,7 +49,20 @@ The real windows are still there, so the count never reaches zero.
 ```
 
 Then grant Accessibility: **System Settings → Privacy & Security → Accessibility
-→ +** → `~/Applications/CloseQuit.app`. Picked up within a few seconds, no restart.
+→ +** → `~/Applications/CloseQuit.app`.
+
+**A running process cannot see a grant made after it started.** `AXIsProcessTrusted()`
+does not flip; only a fresh process sees it. So the daemon exits when it is untrusted
+and lets launchd restart it — it heals itself within about 15 seconds of you granting.
+The settings window says which of those states you are in, and offers a Relaunch
+button when that is the thing that is needed.
+
+Recommended first run, so nothing can be quit while you find out what it does:
+
+```sh
+./setup-signing.sh   # once, so rebuilds stop revoking the permission
+./install.sh
+```
 
 **It ships in dry-run mode** — it logs what it *would* quit and quits nothing.
 Leave it that way for a few days and read the Activity tab, then turn it off.
@@ -75,6 +88,47 @@ the time. The two processes never talk to each other; they share `config.json`.
 and reloads when it changes, so there is nothing to restart.
 
 Editing `config.json` in a text editor still works and is picked up the same way.
+
+## Accessibility, and why it keeps breaking
+
+Two separate traps, both of which produce the same symptom: the daemon runs, uses
+no CPU, and quits nothing.
+
+**1. Every rebuild revokes the grant.** macOS binds an Accessibility grant to the
+app's *designated requirement*. Under an ad-hoc signature that requirement is the
+binary hash, so any code change invalidates it:
+
+```
+designated => identifier "com.ishaanpilar.CloseQuit" and cdhash H"..."
+```
+
+Run `./setup-signing.sh` once. It creates a self-signed code-signing certificate
+named `CloseQuit Local`, and the requirement becomes:
+
+```
+designated => identifier "com.ishaanpilar.CloseQuit" and certificate leaf = H"..."
+```
+
+No binary hash, so the grant survives rebuilds. `build.sh` picks the identity up
+automatically; `CODESIGN_IDENTITY` overrides it if you have a real one. With
+neither, it falls back to ad-hoc and warns.
+
+**2. A running process never sees a new grant.** `AXIsProcessTrusted()` returns
+false for the life of a process that started before the permission was given —
+measured, not assumed. The old code looped on it forever and this README used to
+claim no restart was needed. Both were wrong.
+
+The daemon now exits when untrusted; launchd's `KeepAlive` restarts it, and the new
+process is trusted. `ThrottleInterval` is 15s, so it heals within about that. Run by
+hand instead of under launchd, it exits and the settings window offers **Relaunch**.
+
+After a signature change you usually have to **remove** the old Accessibility entry
+with `−` and add it again — ticking the existing checkbox is not enough. If the list
+gets into a confusing state, clear it outright:
+
+```sh
+tccutil reset Accessibility com.ishaanpilar.CloseQuit
+```
 
 ## Config — `~/.config/closequit/config.json`
 
@@ -118,6 +172,7 @@ own two bundle IDs. Quitting any of those is either destructive or meaningless.
 ## Commands
 
 ```sh
+./setup-signing.sh  # once — stable signing identity, so rebuilds keep the grant
 ./install.sh      # build both apps + run the daemon at login
 ./uninstall.sh    # remove both; leaves your config in place
 ~/Applications/CloseQuit.app/Contents/MacOS/CloseQuit --list   # what it sees, and why
@@ -130,8 +185,20 @@ windows on every Space through Accessibility. Each row says whether the app is
 watched and why (`watched`, `excluded`, `excluded by com.microsoft.*`,
 `not in allowlist`, `never quit`, `menu-bar agent`).
 
-Logs: `~/Library/Logs/closequit.log`. Decisions are always written; `verbose` adds
-the per-tick chatter. There is no rotation yet — see PLAN.md.
+Logs: `~/Library/Logs/closequit.log`, written by the daemon itself — it used to
+write only to stderr and rely on the LaunchAgent to redirect it, which meant that
+launched any other way (double-clicked from Finder, say) the log did not exist at
+all. Decisions are always written; `verbose` adds the per-tick chatter. Rotates at
+1 MB, keeping one generation as `closequit.log.1`. When run from a terminal it also
+echoes to stderr. `closequit.crash.log` catches anything launchd sees.
+
+`~/.config/closequit/status.json` is written every 5s: pid, `startedAt`, `lastTick`,
+`axTrusted`, `state`, `dryRun`, `watching`, `underLaunchd`, and `codeHash`. That is
+what the settings footer reads — checking that a process exists is not enough,
+because an untrusted daemon looks identical to a working one from the outside.
+
+`codeHash` is the signature's cdhash. If it changes between two runs, a rebuild
+happened, and under ad-hoc signing that alone explains a lost permission.
 
 ## Layout
 

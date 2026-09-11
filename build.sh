@@ -6,6 +6,24 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 APP="$HOME/Applications/CloseQuit.app"
 SETTINGS="$HOME/Applications/CloseQuit Settings.app"
 
+# Signing identity. This matters more than it looks: an ad-hoc signature ties the
+# Accessibility grant to the exact binary hash, so *every code change revokes it*
+# and the daemon silently goes idle. Signing with a stable self-signed certificate
+# keeps the grant across rebuilds. See README, "Rebuilding and Accessibility".
+IDENTITY="${CODESIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ] && security find-identity -v -p codesigning 2>/dev/null \
+        | grep -q "CloseQuit Local"; then
+    IDENTITY="CloseQuit Local"
+fi
+
+sign() {
+    if [ -n "$IDENTITY" ]; then
+        codesign --force --sign "$IDENTITY" "$1"
+    else
+        codesign --force --sign - "$1"
+    fi
+}
+
 # ---------- daemon ----------
 
 rm -rf "$APP"
@@ -32,10 +50,10 @@ PLIST
 # ApplicationServices + CoreServices only. Linking AppKit costs ~5 MB of
 # footprint for a process that draws nothing.
 swiftc -O -o "$APP/Contents/MacOS/CloseQuit" \
-    -framework ApplicationServices -framework CoreServices \
+    -framework ApplicationServices -framework CoreServices -framework Security \
     "$SRC/Sources/Config.swift" "$SRC/Sources/main.swift"
 
-codesign --force --sign - "$APP"
+sign "$APP"
 echo "Built $APP"
 
 # ---------- settings ----------
@@ -69,5 +87,23 @@ PLIST
 swiftc -O -parse-as-library -o "$SETTINGS/Contents/MacOS/CloseQuitSettings" \
     "$SRC/Sources/Config.swift" "$SRC/Sources/SettingsApp.swift"
 
-codesign --force --sign - "$SETTINGS"
+sign "$SETTINGS"
 echo "Built $SETTINGS"
+
+if [ -z "$IDENTITY" ]; then
+    cat <<'WARN'
+
+  Signed ad-hoc. macOS ties the Accessibility grant to the exact binary hash, so
+  this build has lost the permission the previous one had.
+
+  To re-grant: System Settings > Privacy & Security > Accessibility. Remove the
+  old CloseQuit entry with "-" and add it again -- ticking the existing checkbox
+  is usually not enough once the hash has changed. Then RELAUNCH the daemon: a
+  running process cannot see a grant made after it started.
+
+  To stop this happening on every rebuild, create a self-signed code-signing
+  certificate named "CloseQuit Local" (Keychain Access > Certificate Assistant >
+  Create a Certificate, type "Code Signing", self-signed). build.sh picks it up
+  automatically, and the grant then survives rebuilds.
+WARN
+fi

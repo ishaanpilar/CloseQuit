@@ -106,7 +106,10 @@ Everything here is a few lines and needs no UI.
 - [x] **Hard exclusions** — Dock, loginwindow, SystemUIServer, WindowServer, Control Center, Notification Center, and CloseQuit itself. No config can opt in
 - [ ] **Idle quit** — windowless app for N minutes → quit. ~15 lines, catches what you ⌘W'd and forgot. The one genuinely worthwhile addition
 - [ ] **`closequit pause 1h`** — touch a file the daemon checks. Kill switch without a UI
-- [ ] **Log rotation** — the plist appends to `~/Library/Logs/closequit.log` forever
+- [x] **The daemon writes its own log** — it wrote only to stderr and depended on the LaunchAgent's `StandardErrorPath`. Launched any other way, every line went to `/dev/null` and the log did not exist, so the Activity tab was permanently empty
+- [x] **Log rotation** — 1 MB, one generation kept
+- [x] **Status file** — `status.json` every 5s, so the settings window can tell *running* from *working*
+- [x] **Stable code-signing identity in `build.sh`** — see below
 - [ ] **`identities` cache eviction** — entries are only dropped for pids that reach `evaluate()`, so pids that fall off the watchlist before dying leak. Small, but this process is meant to run for months
 
 ## What's cut, and why
@@ -133,6 +136,52 @@ Everything here is a few lines and needs no UI.
 5. Run with `dryRun: true` for a week. Read the Activity tab. Ship only when it's boring.
 
 ---
+
+## Two Accessibility traps, both measured
+
+**A running process never observes a new grant.** `AXIsProcessTrusted()` stays false
+for the life of a process that started before the permission was given. Verified
+directly: granted the permission, watched `axTrusted` stay `false` in a daemon with
+193s of uptime, killed it, and the next process reported `true` and `watching: 3`
+immediately.
+
+The old gate looped on `AXIsProcessTrusted()` forever and the README promised "no
+restart needed". Both wrong, and the failure is silent. The daemon now exits when
+untrusted and relies on launchd `KeepAlive` + `ThrottleInterval 15` to restart it
+with a fresh check; the settings window offers Relaunch when there is no launchd.
+
+This is what SmartClose's `PermissionRowStatus.recoveryNeeded` ("Needs relaunch")
+and `AppRelauncher` exist for. They reached the same conclusion.
+
+## The ad-hoc signing trap
+
+macOS binds an Accessibility grant to the app's designated requirement. Under an
+ad-hoc signature that requirement is the binary hash, so **every code change
+revokes the permission**. Verified: two builds from identical sources produce the
+same CDHash, and any source change produces a different one.
+
+The failure is silent and looks exactly like a logic bug — the daemon runs, uses no
+CPU, and quits nothing. It cost real debugging time. Three defences now exist:
+
+1. `build.sh` prefers a stable identity — `CODESIGN_IDENTITY`, or a self-signed
+   certificate named `CloseQuit Local` — and warns loudly when it falls back to ad-hoc.
+2. The daemon logs the wait and reports `axTrusted` in `status.json`.
+3. The settings footer turns orange and names the cause.
+
+`./setup-signing.sh` creates the certificate non-interactively. Note that importing
+is not enough — an untrusted certificate reports `CSSMERR_TP_NOT_TRUSTED` and
+codesign will not use it; `security add-trusted-cert` is the step that matters.
+
+Do not "fix" a mysteriously idle daemon by rewriting the engine. Check `axTrusted`
+and `codeHash` in `status.json` first.
+
+### A measurement trap that cost time
+
+`CloseQuit --list` run from a terminal reported working AX data while the daemon was
+untrusted, which looked like proof the permission was fine. It was not: TCC attributes
+a request to the **responsible process**, and for a binary exec'd from a shell that is
+the terminal. The test was reading the terminal's grant. Judge the daemon only by
+`axTrusted` in `status.json`, never by running the binary by hand.
 
 ## Notes on SmartClose
 

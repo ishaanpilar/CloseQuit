@@ -18,8 +18,14 @@ cat > "$PLIST" <<PL
     <key>ProgramArguments</key>
     <array><string>$APP/Contents/MacOS/CloseQuit</string></array>
     <key>RunAtLoad</key>          <true/>
+    <!-- KeepAlive is load-bearing, not just resilience: a process cannot observe an
+         Accessibility grant made after it launched, so the daemon exits when it is
+         untrusted and relies on launchd to restart it with a fresh check. -->
     <key>KeepAlive</key>          <true/>
-    <key>StandardErrorPath</key>  <string>$HOME/Library/Logs/closequit.log</string>
+    <key>ThrottleInterval</key>   <integer>15</integer>
+    <!-- The daemon writes closequit.log itself. This catches only crash output,
+         which would otherwise interleave into the same file. -->
+    <key>StandardErrorPath</key>  <string>$HOME/Library/Logs/closequit.crash.log</string>
 </dict>
 </plist>
 PL
