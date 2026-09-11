@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import ApplicationServices
 
 // CloseQuit Settings — a plain window that reads and writes the same config.json
 // the daemon watches. There is no IPC and no shared process: you open it, change
@@ -14,6 +15,49 @@ struct AppEntry: Identifiable, Hashable {
     let name: String
     let running: Bool
     var id: String { bundleID }
+}
+
+/// What the daemon writes to `~/.config/closequit/status.json` every few seconds.
+/// Checking that a process merely exists is not enough: a daemon parked in the
+/// Accessibility wait loop is running and doing nothing, and looks identical.
+struct DaemonStatus {
+    let lastTick: Date
+    let axTrusted: Bool
+    let state: String
+    let dryRun: Bool
+    let watching: Int
+    let underLaunchd: Bool
+    let codeHash: String?
+
+    /// Written every 5s, so anything older means it died or wedged — and a stale
+    /// file left behind by a killed process must never read as running.
+    var alive: Bool { Date().timeIntervalSince(lastTick) < 12 }
+    var age: Int { max(0, Int(Date().timeIntervalSince(lastTick))) }
+
+    static func read() -> DaemonStatus? {
+        let url = URL(fileURLWithPath: NSHomeDirectory() + "/.config/closequit/status.json")
+        guard let data = try? Data(contentsOf: url),
+              let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let tick = o["lastTick"] as? Double else { return nil }
+        return DaemonStatus(lastTick: Date(timeIntervalSince1970: tick),
+                            axTrusted: o["axTrusted"] as? Bool ?? false,
+                            state: o["state"] as? String ?? "granted",
+                            dryRun: o["dryRun"] as? Bool ?? false,
+                            watching: o["watching"] as? Int ?? 0,
+                            underLaunchd: o["underLaunchd"] as? Bool ?? false,
+                            codeHash: o["codeHash"] as? String)
+    }
+}
+
+/// What the footer is actually reporting. Borrowed from SmartClose's
+/// PermissionRowStatus: "needs relaunch" is a state of its own, not a flavour of
+/// "missing", and it is the one a user cannot guess their way out of.
+enum Health {
+    case notInstalled       // no LaunchAgent and nothing running
+    case stopped            // was running, is not now
+    case waitingForGrant    // running, untrusted, prompt is the next step
+    case needsRelaunch      // granted since this process started — it cannot see it
+    case working(DaemonStatus)
 }
 
 enum Mode: String, CaseIterable, Identifiable {
@@ -36,7 +80,9 @@ final class Model: ObservableObject {
     @Published var newPattern = ""
     @Published var activity: [String] = []
     @Published var quitsOnly = false
-    @Published var daemonRunning = false
+    @Published var status: DaemonStatus?
+    @Published var launchAgentInstalled = false
+    @Published var grantedNow = false
     @Published var error: String?
 
     private var pendingSave: DispatchWorkItem?
@@ -107,8 +153,42 @@ final class Model: ObservableObject {
     }
 
     func refreshDaemon() {
-        daemonRunning = NSWorkspace.shared.runningApplications
-            .contains { $0.bundleIdentifier == Model.daemonBundleID }
+        status = DaemonStatus.read()
+        launchAgentInstalled = FileManager.default.fileExists(atPath: Model.launchAgentPath)
+        // A grant made after the daemon started is invisible to it, but not to us:
+        // this process is fresh enough to see the truth.
+        grantedNow = AXIsProcessTrusted()
+    }
+
+    static let launchAgentPath =
+        NSHomeDirectory() + "/Library/LaunchAgents/com.ishaanpilar.CloseQuit.plist"
+    static let daemonPath = NSHomeDirectory() + "/Applications/CloseQuit.app"
+
+    var health: Health {
+        guard let s = status, s.alive else {
+            return launchAgentInstalled ? .stopped : .notInstalled
+        }
+        if s.axTrusted { return .working(s) }
+        return grantedNow ? .needsRelaunch : .waitingForGrant
+    }
+
+    /// Under launchd, kickstart -k is the correct restart. Otherwise re-open the
+    /// bundle the way SmartClose's AppRelauncher does.
+    func relaunchDaemon() {
+        let p = Process()
+        if launchAgentInstalled {
+            p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            p.arguments = ["kickstart", "-k", "gui/\(getuid())/com.ishaanpilar.CloseQuit"]
+        } else {
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+            p.arguments = ["-n", Model.daemonPath]
+        }
+        do { try p.run() } catch { self.error = error.localizedDescription }
+    }
+
+    func openAccessibilitySettings() {
+        NSWorkspace.shared.open(URL(string:
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
     /// Tail the log rather than reading it whole — it is append-only and can grow
@@ -425,24 +505,53 @@ struct SettingsView: View {
 
     // MARK: Footer
 
+    private var banner: (dot: Color, text: String, tint: Color) {
+        switch model.health {
+        case .notInstalled:
+            return (.secondary, "Not installed — run ./install.sh", .secondary)
+        case .stopped:
+            return (.secondary, "Daemon stopped", .secondary)
+        case .waitingForGrant:
+            return (.orange, "Accessibility not granted — CloseQuit is watching nothing", .orange)
+        case .needsRelaunch:
+            return (.orange,
+                    "Accessibility is granted, but the daemon started before you granted it "
+                    + "— it needs a relaunch to see it", .orange)
+        case .working(let s):
+            return (.green,
+                    "Running · \(s.dryRun ? "dry run" : "live") · watching \(s.watching) "
+                    + "· checked \(s.age)s ago", .secondary)
+        }
+    }
+
+    @ViewBuilder private var healthActions: some View {
+        switch model.health {
+        case .waitingForGrant:
+            Button("Open Accessibility") { model.openAccessibilitySettings() }
+            Button("Relaunch") { model.relaunchDaemon() }
+        case .needsRelaunch:
+            // The one action a user cannot guess, so it is the prominent one.
+            Button("Relaunch daemon") { model.relaunchDaemon() }
+                .buttonStyle(.borderedProminent)
+        case .stopped:
+            Button("Start") { model.relaunchDaemon() }
+        case .notInstalled, .working:
+            Button("Accessibility…") { model.openAccessibilitySettings() }
+        }
+    }
+
     private var footer: some View {
         HStack(spacing: 10) {
-            Circle().fill(model.daemonRunning ? Color.green : Color.secondary)
-                .frame(width: 8, height: 8)
-            Text(model.daemonRunning
-                 ? "Daemon running — changes apply within a second."
-                 : "Daemon not running. Run ./install.sh.")
-                .font(.callout).foregroundStyle(.secondary)
+            Circle().fill(banner.dot).frame(width: 8, height: 8)
+            Text(banner.text).font(.callout).foregroundStyle(banner.tint)
+                .fixedSize(horizontal: false, vertical: true)
 
             if let error = model.error {
                 Text(error).font(.callout).foregroundStyle(.red).lineLimit(1)
             }
             Spacer()
 
-            Button("Accessibility…") {
-                NSWorkspace.shared.open(URL(string:
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-            }
+            healthActions
             Button("Config") { NSWorkspace.shared.activateFileViewerSelecting([Config.url]) }
         }
         .padding(12)

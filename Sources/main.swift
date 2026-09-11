@@ -2,6 +2,7 @@ import Foundation
 import ApplicationServices
 import CoreServices
 import Darwin
+import Security
 
 // closequit — quits an app when its last window closes.
 // No AppKit, no NSApplication, no UI. A timer and two system calls.
@@ -50,22 +51,115 @@ func settingsSummary() -> String {
 }
 
 // MARK: - Logging
+//
+// The daemon writes its own log file. It used to write only to stderr and rely on
+// the LaunchAgent's StandardErrorPath to put it somewhere — which meant that
+// launched any other way (double-clicked from Finder, say) every line went to
+// /dev/null and the log simply did not exist.
+
+let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/closequit.log")
+let logRotateBytes: UInt64 = 1_000_000
+var logHandle: FileHandle?
+/// Only echo to stderr when a human is watching. Under launchd this is false, so
+/// there is no chance of double-writing into the same file.
+let attachedToTerminal = isatty(STDERR_FILENO) == 1
+
+func openLog() {
+    let fm = FileManager.default
+    try? fm.createDirectory(at: logURL.deletingLastPathComponent(),
+                            withIntermediateDirectories: true)
+    if !fm.fileExists(atPath: logURL.path) { fm.createFile(atPath: logURL.path, contents: nil) }
+    logHandle = try? FileHandle(forWritingTo: logURL)
+    _ = try? logHandle?.seekToEnd()
+}
+
+/// One generation back is enough — this is a debugging aid, not an audit trail.
+func rotateIfNeeded() {
+    guard let h = logHandle, ((try? h.offset()) ?? 0) > logRotateBytes else { return }
+    try? h.close()
+    let previous = logURL.appendingPathExtension("1")
+    try? FileManager.default.removeItem(at: previous)
+    try? FileManager.default.moveItem(at: logURL, to: previous)
+    openLog()
+}
 
 func stamped(_ s: String) -> Data {
     let t = DateFormatter(); t.dateFormat = "HH:mm:ss"
     return "[\(t.string(from: Date()))] \(s)\n".data(using: .utf8)!
 }
 
+func emit(_ s: String) {
+    let line = stamped(s)
+    if attachedToTerminal { FileHandle.standardError.write(line) }
+    rotateIfNeeded()
+    try? logHandle?.write(contentsOf: line)
+}
+
 /// Chatter — per-tick counts, cancellations. Only with `verbose`.
 func log(_ s: String) {
     guard verbose else { return }
-    FileHandle.standardError.write(stamped(s))
+    emit(s)
 }
 
 /// Decisions — quits, would-be quits, lifecycle. Always written, because a dry run
 /// whose log is empty tells you nothing about whether it is safe to switch on.
-func note(_ s: String) {
-    FileHandle.standardError.write(stamped(s))
+func note(_ s: String) { emit(s) }
+
+// MARK: - Code identity
+//
+// SmartClose keeps an AppIdentitySnapshot (bundle id, path, signing identifier) so
+// it can tell when the identity a permission was granted to has changed. For an
+// ad-hoc signed build the signing identifier never changes — the *cdhash* does, and
+// that is what TCC actually binds to. So we report the hash.
+
+func codeSigningHash() -> String? {
+    var code: SecCode?
+    guard SecCodeCopySelf([], &code) == errSecSuccess, let code else { return nil }
+    var stat: SecStaticCode?
+    guard SecCodeCopyStaticCode(code, [], &stat) == errSecSuccess, let stat else { return nil }
+    var info: CFDictionary?
+    guard SecCodeCopySigningInformation(stat, SecCSFlags(rawValue: kSecCSSigningInformation), &info)
+            == errSecSuccess,
+          let dict = info as? [String: Any],
+          let unique = dict[kSecCodeInfoUnique as String] as? Data else { return nil }
+    return unique.map { String(format: "%02x", $0) }.joined()
+}
+
+// MARK: - Status
+//
+// So the settings app can distinguish "the process exists" from "the process is
+// actually doing its job". A daemon parked in the Accessibility wait loop looks
+// identical to a working one from the outside.
+
+let statusURL = URL(fileURLWithPath: NSHomeDirectory() + "/.config/closequit/status.json")
+/// launchd is pid 1, and is our direct parent when bootstrapped as a LaunchAgent.
+/// It decides whether exiting means "restart me" or "goodbye".
+let underLaunchd = getppid() == 1
+let startedAt = Date()
+var lastStatusWrite = Date.distantPast
+
+/// `state` is the field the settings app actually branches on. "waiting" is not the
+/// same as "missing": this process cannot observe a grant made after it launched, so
+/// it is reporting a condition only a relaunch can clear.
+func writeStatus(watching: Int, state: String = "granted", force: Bool = false) {
+    let now = Date()
+    guard force || now.timeIntervalSince(lastStatusWrite) >= 5 else { return }
+    lastStatusWrite = now
+    var payload: [String: Any] = [
+        "pid": ProcessInfo.processInfo.processIdentifier,
+        "startedAt": startedAt.timeIntervalSince1970,
+        "lastTick": now.timeIntervalSince1970,
+        "axTrusted": AXIsProcessTrusted(),
+        "state": state,
+        "dryRun": dryRun,
+        "watching": watching,
+        "underLaunchd": underLaunchd,
+    ]
+    if let hash = codeSigningHash() { payload["codeHash"] = hash }
+    guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+    try? FileManager.default.createDirectory(
+        at: statusURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try? data.write(to: statusURL, options: .atomic)
 }
 
 // MARK: - Process identity
@@ -213,6 +307,7 @@ func tick() {
     }
     for (pid, st) in states where st.zeroStreak > 0 { due.insert(pid) }
     for pid in due { evaluate(pid, snap) }
+    writeStatus(watching: due.filter(eligible).count)
 }
 
 // MARK: - Entry
@@ -252,6 +347,7 @@ func printList() {
     }
 }
 
+openLog()
 forceVerbose = CommandLine.arguments.contains("-v")
 forceDryRun = CommandLine.arguments.contains("--dry-run")
 configSeen = Config.modificationDate()
@@ -265,14 +361,37 @@ if CommandLine.arguments.contains("--list") {
     printList(); exit(0)
 }
 
-// Prompt once, then wait in-process. Picks the grant up within a few seconds, so
-// there is nothing to restart after granting.
+// The permission gate.
+//
+// Measured, the hard way: `AXIsProcessTrusted()` does NOT flip inside a process that
+// was already running when the grant was made. The old code looped on it forever and
+// claimed in the README that no restart was needed. Both were wrong — the daemon sat
+// idle indefinitely while System Settings showed the checkbox ticked.
+//
+// A fresh process sees the grant immediately, so the fix is to end this one. Under
+// launchd, KeepAlive restarts us and the new process is trusted. Launched by hand,
+// we exit and the settings window offers a Relaunch button.
 if !AXIsProcessTrustedWithOptions(
         [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary) {
-    FileHandle.standardError.write("closequit: waiting for Accessibility permission\n".data(using: .utf8)!)
-    while !AXIsProcessTrusted() { Thread.sleep(forTimeInterval: 3) }
+    note("Accessibility not granted — prompting")
+    // Poll briefly anyway: it costs nothing, and if some macOS version does update
+    // in-process we skip a needless restart.
+    let deadline = Date().addingTimeInterval(45)
+    while Date() < deadline, !AXIsProcessTrusted() {
+        writeStatus(watching: 0, state: "waiting", force: true)
+        Thread.sleep(forTimeInterval: 3)
+    }
+    if !AXIsProcessTrusted() {
+        note(underLaunchd
+             ? "still not granted — exiting so launchd restarts us with a fresh check"
+             : "still not granted — exiting. Grant it, then relaunch CloseQuit.")
+        writeStatus(watching: 0, state: "waiting", force: true)
+        exit(1)
+    }
+    note("Accessibility granted")
 }
 
 note("closequit started — \(settingsSummary())")
+writeStatus(watching: 0, force: true)
 startTimer()
 RunLoop.main.run()
