@@ -8,36 +8,64 @@ import Darwin
 
 // MARK: - Config
 
-var excluded: Set<String> = [
-    "com.apple.finder", "com.apple.systempreferences", "com.apple.Music",
-    "com.apple.TV", "com.apple.MobileSMS", "com.apple.mail",
-    "com.apple.ActivityMonitor", "com.spotify.client",
-    "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",
-    "dev.warp.Warp-Stable", "net.kovidgoyal.kitty", "io.alacritty", "com.github.wez.wezterm",
-]
-var only: Set<String>?
+// Resolved values, refreshed from disk whenever the file changes. The config model
+// itself lives in Config.swift, shared with the settings app.
+var cfg = Config()
 var pollInterval = 0.8
 var zeroReadingsRequired = 3
 var verbose = false
 var dryRun = false
 
-func loadConfig() {
-    let url = URL(fileURLWithPath: NSHomeDirectory() + "/.config/closequit/config.json")
-    guard let data = try? Data(contentsOf: url),
-          let o = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return }
-    if let v = o["exclude"] as? [String] { excluded = Set(v) }
-    if let v = o["alsoExclude"] as? [String] { excluded.formUnion(v) }
-    if let v = o["only"] as? [String], !v.isEmpty { only = Set(v) }
-    if let v = o["pollInterval"] as? Double { pollInterval = max(0.2, v) }
-    if let v = o["zeroReadingsRequired"] as? Int { zeroReadingsRequired = max(1, v) }
-    if let v = o["verbose"] as? Bool { verbose = v }
-    if let v = o["dryRun"] as? Bool { dryRun = v }
+// Flags override the file, so `-v` and `--dry-run` stay honoured across reloads.
+var forceVerbose = false
+var forceDryRun = false
+
+var configSeen: Date?
+
+func applyConfig() {
+    pollInterval = cfg.effectivePollInterval
+    zeroReadingsRequired = cfg.effectiveZeroReadings
+    verbose = (cfg.verbose ?? false) || forceVerbose
+    dryRun = (cfg.dryRun ?? false) || forceDryRun
 }
 
+/// One stat per tick. Cheap enough to do unconditionally, and it means edits from
+/// the settings app (or a text editor) take effect within a poll instead of needing
+/// `launchctl kickstart`.
+func reloadIfChanged() {
+    let stamp = Config.modificationDate()
+    guard stamp != configSeen else { return }
+    configSeen = stamp
+    let previousInterval = pollInterval
+    cfg = Config.load()
+    applyConfig()
+    note("config reloaded — \(settingsSummary())")
+    if pollInterval != previousInterval { restartTimer() }
+}
+
+func settingsSummary() -> String {
+    let scope = cfg.effectiveOnly.map { "only \($0.count) rule(s)" }
+        ?? "\(cfg.effectiveExcluded.count) excluded"
+    return "poll \(pollInterval)s, \(zeroReadingsRequired) readings, \(scope)\(dryRun ? ", DRY RUN" : "")"
+}
+
+// MARK: - Logging
+
+func stamped(_ s: String) -> Data {
+    let t = DateFormatter(); t.dateFormat = "HH:mm:ss"
+    return "[\(t.string(from: Date()))] \(s)\n".data(using: .utf8)!
+}
+
+/// Chatter — per-tick counts, cancellations. Only with `verbose`.
 func log(_ s: String) {
     guard verbose else { return }
-    let t = DateFormatter(); t.dateFormat = "HH:mm:ss"
-    FileHandle.standardError.write("[\(t.string(from: Date()))] \(s)\n".data(using: .utf8)!)
+    FileHandle.standardError.write(stamped(s))
+}
+
+/// Decisions — quits, would-be quits, lifecycle. Always written, because a dry run
+/// whose log is empty tells you nothing about whether it is safe to switch on.
+func note(_ s: String) {
+    FileHandle.standardError.write(stamped(s))
 }
 
 // MARK: - Process identity
@@ -68,8 +96,7 @@ func identity(_ pid: pid_t) -> Identity? {
 
 func eligible(_ pid: pid_t) -> Bool {
     guard let id = identity(pid), !id.isAgent, !id.bundleID.isEmpty else { return false }
-    if let only { return only.contains(id.bundleID) }
-    return !excluded.contains(id.bundleID)
+    return cfg.manages(id.bundleID)
 }
 
 // MARK: - Window counting
@@ -170,11 +197,12 @@ func evaluate(_ pid: pid_t, _ snap: Snapshot) {
     }
 
     s.zeroStreak = 0; s.quitRequested = true
-    if dryRun { log("\(name): WOULD QUIT (dry run)") }
-    else { log("\(name): last window closed — quitting"); quit(pid) }
+    if dryRun { note("\(name): WOULD QUIT (dry run)") }
+    else { note("\(name): last window closed — quitting"); quit(pid) }
 }
 
 func tick() {
+    reloadIfChanged()
     let snap = snapshot()
     for pid in snap.visible { watchlist[pid] = 12 }   // ~10s of grace at 0.8s
 
@@ -189,6 +217,20 @@ func tick() {
 
 // MARK: - Entry
 
+var timer: Timer?
+
+func startTimer() {
+    let t = Timer(timeInterval: pollInterval, repeats: true) { _ in tick() }
+    RunLoop.main.add(t, forMode: .common)
+    timer = t
+}
+
+func restartTimer() {
+    timer?.invalidate()
+    startTimer()
+}
+
+
 func printList() {
     func pad(_ s: String, _ n: Int) -> String {
         s.count >= n ? String(s.prefix(n)) : s + String(repeating: " ", count: n - s.count)
@@ -198,18 +240,23 @@ func printList() {
     for pid in snap.visible.sorted() {
         guard let id = identity(pid) else { continue }
         let why: String
-        if id.isAgent { why = "no (menu-bar agent)" }
-        else if let only { why = only.contains(id.bundleID) ? "yes" : "no (not in only)" }
-        else { why = excluded.contains(id.bundleID) ? "no (excluded)" : "yes" }
+        if id.isAgent {
+            why = "no (menu-bar agent)"
+        } else {
+            let v = cfg.verdict(for: id.bundleID)
+            why = v.managed ? "yes (\(v.reason))" : "no (\(v.reason))"
+        }
         print(pad(id.name, 22) + pad(id.bundleID, 38)
               + pad(axWindowCount(pid).map(String.init) ?? "?", 5)
               + pad(snap.bigVisible.contains(pid) ? "yes" : "no", 10) + why)
     }
 }
 
-loadConfig()
-if CommandLine.arguments.contains("-v") { verbose = true }
-if CommandLine.arguments.contains("--dry-run") { dryRun = true }
+forceVerbose = CommandLine.arguments.contains("-v")
+forceDryRun = CommandLine.arguments.contains("--dry-run")
+configSeen = Config.modificationDate()
+cfg = Config.load()
+applyConfig()
 
 if CommandLine.arguments.contains("--list") {
     guard AXIsProcessTrusted() else {
@@ -226,7 +273,6 @@ if !AXIsProcessTrustedWithOptions(
     while !AXIsProcessTrusted() { Thread.sleep(forTimeInterval: 3) }
 }
 
-log("closequit started (poll \(pollInterval)s, \(zeroReadingsRequired) readings\(dryRun ? ", DRY RUN" : ""))")
-let timer = Timer(timeInterval: pollInterval, repeats: true) { _ in tick() }
-RunLoop.main.add(timer, forMode: .common)
+note("closequit started — \(settingsSummary())")
+startTimer()
 RunLoop.main.run()
