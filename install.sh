@@ -32,5 +32,8 @@ echo "Installed and running."
 echo "Grant Accessibility to CloseQuit:"
 echo "  System Settings > Privacy & Security > Accessibility > + > $APP"
 echo
-echo "Logs:   ~/Library/Logs/closequit.log"
-echo "Config: ~/.config/closequit/config.json"
+echo "Settings: open \"$HOME/Applications/CloseQuit Settings.app\""
+echo "Logs:     ~/Library/Logs/closequit.log"
+echo "Config:   ~/.config/closequit/config.json"
+echo
+echo "Config changes apply within a second — no need to restart the daemon."
