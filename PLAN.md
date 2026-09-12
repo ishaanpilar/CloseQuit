@@ -201,6 +201,35 @@ memory one. While the daemon is under observation:
 This is why the Activity summary was built before idle quit and pause, which are
 daemon changes and belong in one batch after the window closes.
 
+## The settings window can clobber the config
+
+Found the hard way, twice: the window held a `Config` loaded at launch and wrote the
+whole struct back on any change. A window left open overnight therefore wrote its
+stale copy over a file that had been corrected in the meantime, silently restoring
+the exclusion list that had just been removed. SwiftUI makes this worse than it
+sounds — a `Binding`'s `set` can fire during a re-render with the value it already
+has, so a passive redraw becomes a full config write.
+
+Two fixes, both required:
+
+1. **Every mutation is a read-modify-write.** `Model.mutate` re-reads the file first
+   (unless one of our own writes is already queued), applies just that edit, then
+   saves. An external edit can no longer be lost to a stale snapshot.
+2. **Guarded setters.** `setDryRun`, `setVerbose`, `setPollInterval`,
+   `setZeroReadings`, `setMode` and `setManaged` all return early when the value has
+   not actually changed, so a redraw cannot write anything at all.
+
+No view writes `cfg` directly any more; `scheduleSave` is private.
+
+## Colour: semantic, not accent
+
+The design mocks used blue for the "recommended" wash, the timing callout and the
+"matched by rule" pill. Implemented literally as `accentColor` those follow the user's
+system accent — and on a machine with a red accent an informational box reads as an
+error. Status surfaces now use fixed semantic colours (blue for information, orange
+for warning, green/red/yellow/orange/grey for the footer states). `accentColor` is
+left to selection and primary actions, where the system already uses it.
+
 ## Notes on SmartClose
 
 [mahirozdin/SmartClose](https://github.com/mahirozdin/SmartClose) solves the same

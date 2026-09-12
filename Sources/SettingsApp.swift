@@ -338,6 +338,45 @@ final class Model: ObservableObject {
         }
     }
 
+    /// Every mutation is a read-modify-write against the newest config on disk, unless a
+    /// write of ours is already queued. Without this the window can hold a snapshot taken
+    /// minutes ago and write the whole thing back, silently undoing an edit made in the
+    /// file or by another window. That is exactly how the default exclusions were lost:
+    /// a window left open overnight wrote its stale copy back over a corrected file.
+    private func mutate(_ change: (inout Config) -> Void) {
+        if pendingSave == nil {
+            let disk = Config.load()
+            if disk != cfg {
+                cfg = disk
+                mode = (disk.only?.isEmpty == false) ? .only : .exclude
+            }
+        }
+        change(&cfg)
+        scheduleSave()
+    }
+
+    // Guarded setters. SwiftUI can invoke a Binding's `set` during a re-render with the
+    // value it already has; unguarded, that turns a passive redraw into a config write.
+    func setDryRun(_ v: Bool) {
+        guard (cfg.dryRun ?? false) != v else { return }
+        mutate { $0.dryRun = v }
+    }
+
+    func setVerbose(_ v: Bool) {
+        guard (cfg.verbose ?? false) != v else { return }
+        mutate { $0.verbose = v }
+    }
+
+    func setPollInterval(_ v: Double) {
+        guard cfg.effectivePollInterval != v else { return }
+        mutate { $0.pollInterval = v }
+    }
+
+    func setZeroReadings(_ v: Int) {
+        guard cfg.effectiveZeroReadings != v else { return }
+        mutate { $0.zeroReadingsRequired = v }
+    }
+
     func isManaged(_ bundleID: String) -> Bool { cfg.manages(bundleID) }
 
     /// A row governed by a wildcard must not be toggled directly — doing so would have
@@ -345,24 +384,28 @@ final class Model: ObservableObject {
     func lockingPattern(_ bundleID: String) -> String? { cfg.verdict(for: bundleID).pattern }
 
     func setManaged(_ bundleID: String, _ managed: Bool) {
-        guard lockingPattern(bundleID) == nil else { return }
-        switch mode {
-        case .only:
-            var s = Set(cfg.only ?? [])
-            if managed { s.insert(bundleID) } else { s.remove(bundleID) }
-            cfg.only = s.sorted()
-        case .exclude:
-            var s = cfg.effectiveExcluded
-            if managed { s.remove(bundleID) } else { s.insert(bundleID) }
-            cfg.setExcluded(s)
+        guard lockingPattern(bundleID) == nil, isManaged(bundleID) != managed else { return }
+        let currentMode = mode
+        mutate { c in
+            switch currentMode {
+            case .only:
+                var s = Set(c.only ?? [])
+                if managed { s.insert(bundleID) } else { s.remove(bundleID) }
+                c.only = s.sorted()
+            case .exclude:
+                var s = c.effectiveExcluded
+                if managed { s.remove(bundleID) } else { s.insert(bundleID) }
+                c.setExcluded(s)
+            }
         }
-        scheduleSave()
     }
 
     func setMode(_ m: Mode) {
+        guard m != mode else { return }
         mode = m
-        if m == .exclude { cfg.only = nil } else if cfg.only == nil { cfg.only = [] }
-        scheduleSave()
+        mutate { c in
+            if m == .exclude { c.only = nil } else if c.only == nil { c.only = [] }
+        }
         refreshApps()
     }
 
@@ -371,30 +414,34 @@ final class Model: ObservableObject {
     func addPattern() {
         let p = newPattern.trimmingCharacters(in: .whitespaces)
         guard !p.isEmpty, p.contains("*") else { return }
-        switch mode {
-        case .only:
-            var s = Set(cfg.only ?? []); s.insert(p); cfg.only = s.sorted()
-        case .exclude:
-            var s = cfg.effectiveExcluded; s.insert(p); cfg.setExcluded(s)
+        let currentMode = mode
+        mutate { c in
+            switch currentMode {
+            case .only:
+                var s = Set(c.only ?? []); s.insert(p); c.only = s.sorted()
+            case .exclude:
+                var s = c.effectiveExcluded; s.insert(p); c.setExcluded(s)
+            }
         }
         newPattern = ""
-        scheduleSave(after: 0)
         refreshApps()
     }
 
     func removePattern(_ p: String) {
-        switch mode {
-        case .only:
-            var s = Set(cfg.only ?? []); s.remove(p); cfg.only = s.sorted()
-        case .exclude:
-            var s = cfg.effectiveExcluded; s.remove(p); cfg.setExcluded(s)
+        let currentMode = mode
+        mutate { c in
+            switch currentMode {
+            case .only:
+                var s = Set(c.only ?? []); s.remove(p); c.only = s.sorted()
+            case .exclude:
+                var s = c.effectiveExcluded; s.remove(p); c.setExcluded(s)
+            }
         }
-        scheduleSave(after: 0)
         refreshApps()
     }
 
     /// Coalesce bursts from steppers and rapid toggling into one atomic write.
-    func scheduleSave(after delay: TimeInterval = 0.35) {
+    private func scheduleSave(after delay: TimeInterval = 0.35) {
         pendingSave?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -411,6 +458,130 @@ final class Model: ObservableObject {
         }
         pendingSave = work
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+}
+
+// MARK: - Building blocks
+
+/// Card surfaces, leading row icons, status pills and the tinted callout all come from
+/// the design pass. They are deliberately hand-built rather than a `Form`: a grouped
+/// Form cannot tint an individual row (the "recommended" treatment on Dry run) or put
+/// an icon in the leading edge without fighting it.
+private let cardRadius: CGFloat = 8
+
+private struct Card<Content: View>: View {
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(spacing: 0) { content }
+            .background(Color(nsColor: .controlBackgroundColor),
+                        in: RoundedRectangle(cornerRadius: cardRadius))
+            .overlay(RoundedRectangle(cornerRadius: cardRadius)
+                .strokeBorder(Color(nsColor: .separatorColor).opacity(0.6)))
+    }
+}
+
+private struct SectionLabel: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.headline).padding(.bottom, 6)
+    }
+}
+
+/// A dot plus a word, in a tinted capsule. Says at a glance whether a row is live,
+/// idle, or governed by something the user cannot toggle here.
+struct StatusPill: View {
+    let text: String
+    let tint: Color
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().fill(tint).frame(width: 6, height: 6)
+            Text(text).font(.caption)
+        }
+        .foregroundStyle(tint)
+        .padding(.horizontal, 8).padding(.vertical, 3)
+        .background(tint.opacity(0.12), in: Capsule())
+    }
+}
+
+/// Semantic colour, deliberately not `accentColor`. Accent belongs to selection and
+/// primary actions; a status surface must mean the same thing for every user. With a red
+/// accent an accent-tinted "here is how the timing works" box reads as an error.
+private struct InfoCallout: View {
+    let icon: String
+    let text: String
+    var tint: Color = .blue
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: icon).foregroundStyle(tint)
+            Text(text).font(.callout).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(tint.opacity(0.10), in: RoundedRectangle(cornerRadius: cardRadius))
+    }
+}
+
+private struct SettingRow<Trailing: View>: View {
+    let icon: String
+    let title: String
+    let subtitle: String
+    /// The one setting that should be on while you learn what the daemon does, so it
+    /// gets an accent wash rather than just sitting first in the list.
+    var recommended = false
+    @ViewBuilder var trailing: Trailing
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(recommended ? Color.blue : Color.secondary)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                Text(subtitle).font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            trailing.padding(.top, 1)
+        }
+        .padding(12)
+        .background(recommended ? Color.blue.opacity(0.10) : Color.clear)
+    }
+}
+
+/// Stepper first, then the value in its own field — matching the mocks.
+private struct SteppedValue<V: Strideable>: View {
+    let display: String
+    @Binding var value: V
+    let range: ClosedRange<V>
+    let step: V.Stride
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Stepper("", value: $value, in: range, step: step).labelsHidden()
+            Text(display).monospacedDigit()
+                .frame(width: 54)
+                .padding(.vertical, 3)
+                .background(Color(nsColor: .textBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 5))
+                .overlay(RoundedRectangle(cornerRadius: 5)
+                    .strokeBorder(Color(nsColor: .separatorColor)))
+        }
+    }
+}
+
+private struct EmptyState: View {
+    let icon: String
+    let title: String
+    let detail: String
+    var body: some View {
+        VStack(spacing: 6) {
+            Image(systemName: icon).font(.title2).foregroundStyle(.secondary)
+            Text(title)
+            Text(detail).font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -432,7 +603,7 @@ struct SettingsView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 560, minHeight: 640)
+        .frame(minWidth: 620, minHeight: 640)
         .onReceive(heartbeat) { _ in
             model.refreshDaemon()
             model.reloadIfChangedExternally()
@@ -443,162 +614,216 @@ struct SettingsView: View {
     // MARK: Behaviour
 
     private var behaviour: some View {
-        Form {
-            Section {
-                Toggle(isOn: Binding(
-                    get: { model.cfg.dryRun ?? false },
-                    set: { model.cfg.dryRun = $0; model.scheduleSave() })) {
-                    Text("Dry run")
-                    Text("Log what would be quit, quit nothing. Leave this on for a few days, "
-                         + "then read the Activity tab.")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 0) {
+                    SectionLabel(text: "Settings")
+                    Card {
+                        SettingRow(icon: "shield.lefthalf.filled",
+                                   title: "Dry run (recommended)",
+                                   subtitle: "Log what would be quit, quit nothing. Leave this on "
+                                           + "for a few days, then read the Activity tab.",
+                                   recommended: true) {
+                            Toggle("", isOn: Binding(
+                                get: { model.cfg.dryRun ?? false },
+                                set: { model.setDryRun($0) }))
+                                .labelsHidden().toggleStyle(.switch)
+                        }
+                        Divider()
+                        SettingRow(icon: "doc.text",
+                                   title: "Verbose logging",
+                                   subtitle: "Per-tick window counts, not just decisions.") {
+                            Toggle("", isOn: Binding(
+                                get: { model.cfg.verbose ?? false },
+                                set: { model.setVerbose($0) }))
+                                .labelsHidden().toggleStyle(.switch)
+                        }
+                    }
                 }
-                Toggle(isOn: Binding(
-                    get: { model.cfg.verbose ?? false },
-                    set: { model.cfg.verbose = $0; model.scheduleSave() })) {
-                    Text("Verbose logging")
-                    Text("Per-tick window counts, not just decisions.")
-                }
-            }
 
-            Section("Timing") {
-                LabeledContent("Check every") {
-                    HStack {
-                        Text(String(format: "%.1f s", model.cfg.effectivePollInterval))
-                            .monospacedDigit().frame(width: 52, alignment: .trailing)
-                        Stepper("", value: Binding(
-                            get: { model.cfg.effectivePollInterval },
-                            set: { model.cfg.pollInterval = $0; model.scheduleSave() }),
-                                in: 0.2...5.0, step: 0.1).labelsHidden()
+                VStack(alignment: .leading, spacing: 0) {
+                    SectionLabel(text: "Timing")
+                    Card {
+                        SettingRow(icon: "clock",
+                                   title: "Check every",
+                                   subtitle: "How often to check for open windows.") {
+                            SteppedValue(display: String(format: "%.1f s",
+                                                         model.cfg.effectivePollInterval),
+                                         value: Binding(
+                                            get: { model.cfg.effectivePollInterval },
+                                            set: { model.setPollInterval($0) }),
+                                         range: 0.2...5.0, step: 0.1)
+                        }
+                        Divider()
+                        SettingRow(icon: "timer",
+                                   title: "Zero readings before quitting",
+                                   subtitle: "An app must report zero windows this many times.") {
+                            SteppedValue(display: "\(model.cfg.effectiveZeroReadings)",
+                                         value: Binding(
+                                            get: { model.cfg.effectiveZeroReadings },
+                                            set: { model.setZeroReadings($0) }),
+                                         range: 1...10, step: 1)
+                        }
                     }
                 }
-                LabeledContent("Zero readings before quitting") {
-                    HStack {
-                        Text("\(model.cfg.effectiveZeroReadings)")
-                            .monospacedDigit().frame(width: 52, alignment: .trailing)
-                        Stepper("", value: Binding(
-                            get: { model.cfg.effectiveZeroReadings },
-                            set: { model.cfg.zeroReadingsRequired = $0; model.scheduleSave() }),
-                                in: 1...10).labelsHidden()
-                    }
-                }
-                Text("An app must report zero windows this many times in a row — "
-                     + String(format: "%.1f s", model.cfg.effectivePollInterval
-                              * Double(model.cfg.effectiveZeroReadings))
-                     + " — before it is quit. Raise it if an app quits during a fullscreen "
-                     + "transition or a window reload.")
-                    .font(.callout).foregroundStyle(.secondary)
+
+                // The two steppers only matter as a product, so the product is spelled out.
+                InfoCallout(icon: "clock",
+                            text: "An app must report zero windows "
+                                + "\(model.cfg.effectiveZeroReadings) times in a row — "
+                                + String(format: "%.1f s", model.cfg.effectivePollInterval
+                                         * Double(model.cfg.effectiveZeroReadings))
+                                + " — before it is quit. Raise it if an app quits during a "
+                                + "fullscreen transition or a window reload.")
             }
+            .padding(16)
         }
-        .formStyle(.grouped)
     }
 
     // MARK: Apps
 
     private var appsTab: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 8) {
-                Picker("CloseQuit watches", selection: Binding(
-                    get: { model.mode }, set: { model.setMode($0) })) {
-                    ForEach(Mode.allCases) { Text($0.label).tag($0) }
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        SectionLabel(text: "CloseQuit watches")
+                        Picker("", selection: Binding(
+                            get: { model.mode }, set: { model.setMode($0) })) {
+                            ForEach(Mode.allCases) { Text($0.label).tag($0) }
+                        }
+                        .pickerStyle(.radioGroup).labelsHidden()
+                    }
+                    Spacer(minLength: 16)
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        TextField("Search apps…", text: $model.search)
+                            .textFieldStyle(.plain)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(Color(nsColor: .textBackgroundColor),
+                                in: RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color(nsColor: .separatorColor)))
+                    .frame(width: 230)
+                    .padding(.top, 22)
                 }
-                .pickerStyle(.radioGroup)
 
                 if model.allowlistEmpty {
-                    Label("No apps turned on yet — until you pick one, CloseQuit falls back to "
-                          + "watching everything except its default exclusions.",
-                          systemImage: "exclamationmark.triangle.fill")
-                        .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    InfoCallout(icon: "exclamationmark.triangle.fill",
+                                text: "No apps turned on yet — until you pick one, CloseQuit "
+                                    + "falls back to watching everything except its default "
+                                    + "exclusions.",
+                                tint: .orange)
                 }
 
-                patternEditor
-                TextField("Search apps", text: $model.search).textFieldStyle(.roundedBorder)
-            }
-            .padding(12)
-
-            List(model.filtered) { app in row(app) }
-        }
-    }
-
-    private var patternEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                TextField("Wildcard rule, e.g. com.microsoft.*", text: $model.newPattern)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { model.addPattern() }
-                Button("Add rule") { model.addPattern() }
-                    .disabled(!model.newPattern.contains("*"))
-            }
-            if !model.cfg.patterns.isEmpty {
-                HStack(spacing: 6) {
-                    ForEach(model.cfg.patterns, id: \.self) { p in
-                        HStack(spacing: 4) {
-                            Text(p).font(.caption).monospaced()
-                            Button {
-                                model.removePattern(p)
-                            } label: {
-                                Image(systemName: "xmark.circle.fill").font(.caption)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        .padding(.horizontal, 7).padding(.vertical, 3)
-                        .background(.quaternary, in: Capsule())
+                VStack(alignment: .leading, spacing: 0) {
+                    SectionLabel(text: "Wildcard rules")
+                    HStack {
+                        TextField("Wildcard rule, e.g. com.microsoft.*", text: $model.newPattern)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { model.addPattern() }
+                        Button("Add rule") { model.addPattern() }
+                            .disabled(!model.newPattern.contains("*"))
                     }
-                    Spacer()
+                    if !model.cfg.patterns.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(model.cfg.patterns, id: \.self) { p in
+                                HStack(spacing: 5) {
+                                    Text(p).font(.caption).monospaced()
+                                    Button { model.removePattern(p) } label: {
+                                        Image(systemName: "xmark").font(.caption2)
+                                    }.buttonStyle(.plain)
+                                }
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(Color(nsColor: .controlBackgroundColor), in: Capsule())
+                                .overlay(Capsule()
+                                    .strokeBorder(Color(nsColor: .separatorColor)))
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 8)
+                    }
                 }
+
+                SectionLabel(text: "Apps").padding(.bottom, -6)
+            }
+            .padding(16)
+
+            if model.filtered.isEmpty {
+                EmptyState(icon: "magnifyingglass", title: "No results.",
+                           detail: "Try a different filter or clear the search.")
+            } else {
+                List(model.filtered) { app in appRow(app) }
             }
         }
     }
 
-    private func row(_ app: AppEntry) -> some View {
+    private func appRow(_ app: AppEntry) -> some View {
         let locked = model.lockingPattern(app.bundleID)
-        return Toggle(isOn: Binding(
-            get: { model.isManaged(app.bundleID) },
-            set: { model.setManaged(app.bundleID, $0) })) {
-            HStack(spacing: 8) {
-                if let icon = Model.icon(for: app.bundleID) {
-                    Image(nsImage: icon).resizable().frame(width: 18, height: 18)
+        return HStack(spacing: 10) {
+            icon(for: app.bundleID)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(app.name)
+                Text(app.bundleID).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+
+            Toggle("", isOn: Binding(
+                get: { model.isManaged(app.bundleID) },
+                set: { model.setManaged(app.bundleID, $0) }))
+                .labelsHidden().toggleStyle(.switch)
+                .disabled(locked != nil)
+
+            Group {
+                if let locked {
+                    StatusPill(text: "Matched by \(locked)", tint: .blue)
+                } else if app.running {
+                    StatusPill(text: "Running", tint: .green)
                 } else {
-                    Image(systemName: "app.dashed").frame(width: 18, height: 18)
-                }
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(app.name)
-                    Text(locked.map { "matched by \($0)" } ?? app.bundleID)
-                        .font(.caption)
-                        .foregroundStyle(locked == nil ? .secondary : Color.accentColor)
-                }
-                if !app.running {
-                    Text("not running").font(.caption).foregroundStyle(.secondary)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(.quaternary, in: Capsule())
+                    StatusPill(text: "Not running", tint: .gray)
                 }
             }
+            .frame(width: 190, alignment: .leading)
         }
-        .toggleStyle(.switch)
-        .disabled(locked != nil)
+        .padding(.vertical, 3)
         .help(locked.map { "Governed by the rule \($0). Remove the rule to set this app on its own." } ?? "")
+    }
+
+    @ViewBuilder private func icon(for bundleID: String?) -> some View {
+        if let bundleID, let img = Model.icon(for: bundleID) {
+            Image(nsImage: img).resizable().frame(width: 22, height: 22)
+        } else {
+            Image(systemName: "questionmark.app.dashed")
+                .foregroundStyle(.secondary).frame(width: 22, height: 22)
+        }
     }
 
     // MARK: Activity
 
     private var activityTab: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Picker("", selection: $model.activityMode) {
                     Text("Summary").tag(0)
                     Text("Log").tag(1)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 180)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 170)
 
                 if model.activityMode == 1 {
                     Toggle("Decisions only", isOn: $model.quitsOnly).toggleStyle(.checkbox)
                 }
                 Spacer()
-                Text("~/Library/Logs/closequit.log").font(.caption).foregroundStyle(.secondary)
+                Text("Log file: ~/Library/Logs/closequit.log")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .padding(12)
+            .padding(16)
 
             if model.entries.isEmpty {
-                emptyActivity
+                EmptyState(icon: "doc.text",
+                           title: "Nothing logged yet.",
+                           detail: "Decisions are always logged. Turn on Verbose to see "
+                                 + "per-tick counts.")
             } else if model.activityMode == 0 {
                 summaryList
             } else {
@@ -607,30 +832,24 @@ struct SettingsView: View {
         }
     }
 
-    private var emptyActivity: some View {
-        VStack(spacing: 6) {
-            Text("Nothing logged yet.").foregroundStyle(.secondary)
-            Text("Decisions are always logged. Turn on Verbose to see per-tick counts.")
-                .font(.callout).foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
     @ViewBuilder private var summaryList: some View {
         let rows = model.summary
         if rows.isEmpty {
-            VStack(spacing: 6) {
-                Text("No quit decisions yet.").foregroundStyle(.secondary)
-                Text("The daemon is watching, but nothing has closed its last window so far.")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            EmptyState(icon: "checkmark.circle",
+                       title: "No quit decisions yet.",
+                       detail: "The daemon is watching, but nothing has closed its last "
+                             + "window so far.")
         } else {
             VStack(alignment: .leading, spacing: 0) {
-                Text("\(rows.count) app\(rows.count == 1 ? "" : "s") would have been quit "
-                     + "· \(rows.reduce(0) { $0 + $1.decisions }) decisions in the recent log")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .padding(.horizontal, 12).padding(.bottom, 8)
+                HStack(spacing: 8) {
+                    Text("\(rows.count) app\(rows.count == 1 ? "" : "s") would have been quit")
+                        .fontWeight(.semibold)
+                    Text("·").foregroundStyle(.secondary)
+                    Text("\(rows.reduce(0) { $0 + $1.decisions }) decisions in the recent log")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.title3)
+                .padding(.horizontal, 16).padding(.bottom, 10)
 
                 List(rows) { row in summaryRow(row) }
             }
@@ -638,68 +857,71 @@ struct SettingsView: View {
     }
 
     private func summaryRow(_ row: AppSummary) -> some View {
-        HStack(spacing: 8) {
-            if let id = row.bundleID, let icon = Model.icon(for: id) {
-                Image(nsImage: icon).resizable().frame(width: 20, height: 20)
-            } else {
-                Image(systemName: "questionmark.app.dashed").frame(width: 20, height: 20)
-            }
-
+        HStack(spacing: 10) {
+            icon(for: row.bundleID)
             VStack(alignment: .leading, spacing: 1) {
                 Text(row.app)
                 Text(row.bundleID ?? "couldn't resolve a bundle id for this name")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Spacer(minLength: 8)
 
-            Spacer()
-
-            VStack(alignment: .trailing, spacing: 1) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text("\(row.decisions)×").monospacedDigit()
-                Text("last \(row.lastSeen)").font(.caption).foregroundStyle(.secondary)
+                Text("Last \(row.lastSeen)").font(.caption).foregroundStyle(.secondary)
             }
+            .frame(width: 92, alignment: .leading)
 
-            // The loop the dry run is for: see it here, act on it here.
-            if let id = row.bundleID {
-                if model.lockingPattern(id) != nil {
-                    Text("by rule").font(.caption).foregroundStyle(.secondary)
-                        .frame(width: 118, alignment: .trailing)
-                } else if model.isManaged(id) {
-                    Button("Stop watching") { model.setManaged(id, false) }
-                        .frame(width: 118)
+            // Reading a dry run and acting on it are the same gesture.
+            Group {
+                if let id = row.bundleID {
+                    if model.lockingPattern(id) != nil {
+                        StatusPill(text: "By rule", tint: .blue)
+                    } else if model.isManaged(id) {
+                        Button("Stop watching") { model.setManaged(id, false) }
+                    } else {
+                        StatusPill(text: "Not watched", tint: .gray)
+                    }
                 } else {
-                    Text("not watched").font(.caption).foregroundStyle(.secondary)
-                        .frame(width: 118, alignment: .trailing)
+                    Text("—").foregroundStyle(.secondary)
                 }
-            } else {
-                Text("—").foregroundStyle(.secondary).frame(width: 118, alignment: .trailing)
             }
+            .frame(width: 120, alignment: .trailing)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 3)
     }
 
-    private var logList: some View {
-        List(model.visibleLog) { e in
-            Text(e.line)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(e.isDecision ? Color.primary : Color.secondary)
-                .textSelection(.enabled)
+    @ViewBuilder private var logList: some View {
+        if model.visibleLog.isEmpty {
+            EmptyState(icon: "magnifyingglass", title: "No results.",
+                       detail: "Try a different filter or clear the search.")
+        } else {
+            List(model.visibleLog) { e in
+                Text(e.line)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(e.isDecision ? Color.primary : Color.secondary)
+                    .textSelection(.enabled)
+            }
         }
     }
 
     // MARK: Footer
 
+    /// Five states, each with its own dot, sentence and primary action. "The process
+    /// exists" and "the daemon is working" are different things, and needsRelaunch is a
+    /// macOS quirk the user cannot guess their way out of — so it gets the loud button.
     private var banner: (dot: Color, text: String, tint: Color) {
         switch model.health {
         case .notInstalled:
-            return (.secondary, "Not installed — run ./install.sh", .secondary)
+            return (.gray, "Not installed — run ./install.sh", .secondary)
         case .stopped:
-            return (.secondary, "Daemon stopped", .secondary)
+            return (.red, "Daemon stopped", .secondary)
         case .waitingForGrant:
-            return (.orange, "Accessibility not granted — CloseQuit is watching nothing", .orange)
+            return (.yellow, "Accessibility not granted — CloseQuit is watching nothing", .primary)
         case .needsRelaunch:
             return (.orange,
                     "Accessibility is granted, but the daemon started before you granted it "
-                    + "— it needs a relaunch to see it", .orange)
+                    + "— it needs a relaunch to see it", .primary)
         case .working(let s):
             return (.green,
                     "Running · \(s.dryRun ? "dry run" : "live") · watching \(s.watching) "
@@ -707,13 +929,11 @@ struct SettingsView: View {
         }
     }
 
-    @ViewBuilder private var healthActions: some View {
+    @ViewBuilder private var primaryAction: some View {
         switch model.health {
         case .waitingForGrant:
             Button("Open Accessibility") { model.openAccessibilitySettings() }
-            Button("Relaunch") { model.relaunchDaemon() }
         case .needsRelaunch:
-            // The one action a user cannot guess, so it is the prominent one.
             Button("Relaunch daemon") { model.relaunchDaemon() }
                 .buttonStyle(.borderedProminent)
         case .stopped:
@@ -732,10 +952,30 @@ struct SettingsView: View {
             if let error = model.error {
                 Text(error).font(.callout).foregroundStyle(.red).lineLimit(1)
             }
-            Spacer()
+            Spacer(minLength: 12)
 
-            healthActions
-            Button("Config") { NSWorkspace.shared.activateFileViewerSelecting([Config.url]) }
+            primaryAction
+
+            Menu {
+                Button("Relaunch daemon") { model.relaunchDaemon() }
+                Button("Open Accessibility settings") { model.openAccessibilitySettings() }
+                Divider()
+                Button("Reveal config file") {
+                    NSWorkspace.shared.activateFileViewerSelecting([Config.url])
+                }
+                Button("Open log file") {
+                    if FileManager.default.fileExists(atPath: Model.logURL.path) {
+                        NSWorkspace.shared.open(Model.logURL)
+                    } else {
+                        NSWorkspace.shared.activateFileViewerSelecting(
+                            [Model.logURL.deletingLastPathComponent()])
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+            .menuStyle(.borderlessButton)
+            .frame(width: 28)
         }
         .padding(12)
     }
