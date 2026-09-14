@@ -8,14 +8,14 @@ only when you need it.
 
 | | |
 |---|---|
-| Daemon memory | ~2.9 MB at start, ~4.5 MB steady (Activity Monitor "Memory") |
-| Daemon CPU | 0.0% idle |
-| Daemon binary | 197 KB, links no AppKit and no SwiftUI |
-| Settings app | 586 KB, runs only while its window is open |
+| Daemon memory | **4.9 MB** steady (`phys_footprint`, what Activity Monitor calls "Memory") |
+| Daemon CPU | 0.1% |
+| Daemon binary | ~200 KB, links no AppKit and no SwiftUI |
+| Settings app | ~590 KB, runs only while its window is open |
 
-> The memory figures were measured before the settings/hot-reload work and have not
-> been re-measured since. The daemon still links nothing new at the framework level,
-> so they should hold, but treat them as pending confirmation.
+Measured with `footprint -p <pid>` on an installed daemon after 8 minutes. `ps` RSS
+reads 18 MB for the same process and is not the number to use — most of it is shared
+framework pages counted against every process on the system.
 
 ## The part that matters: multiple windows
 
@@ -81,8 +81,10 @@ the time. The two processes never talk to each other; they share `config.json`.
 - **Apps** — a switch per running app, plus wildcard rules like `com.microsoft.*`.
   Choose between watching everything except what you turn off, or only what you
   turn on.
-- **Activity** — the tail of the log, newest first, with a *quits only* filter.
-  This is how you read a dry run without opening Console.
+- **Activity** — two views of the same log. **Summary** ranks apps by how often they
+  would have been quit, with a *Stop watching* button on each row, so reading a dry
+  run and acting on it are the same gesture. **Log** is the raw tail, newest first,
+  with a decisions-only filter.
 
 **Changes apply within about a second.** The daemon stats the config file each tick
 and reloads when it changes, so there is nothing to restart.
@@ -174,6 +176,8 @@ own two bundle IDs. Quitting any of those is either destructive or meaningless.
 ```sh
 ./setup-signing.sh  # once — stable signing identity, so rebuilds keep the grant
 ./install.sh      # build both apps + run the daemon at login
+./build.sh settings   # rebuild only the settings app, leaving a running daemon alone
+./build.sh daemon     # rebuild only the daemon
 ./uninstall.sh    # remove both; leaves your config in place
 ~/Applications/CloseQuit.app/Contents/MacOS/CloseQuit --list   # what it sees, and why
 ~/Applications/CloseQuit.app/Contents/MacOS/CloseQuit -v       # run in terminal, verbose

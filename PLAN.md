@@ -129,8 +129,9 @@ Everything here is a few lines and needs no UI.
 ## Remaining work
 
 1. Rerun the live matrix: VS Code, After Effects, Preview, Finder, Safari, Photoshop.
-2. Re-measure the daemon's real footprint — the 2.9 MB figure predates Config.swift
-   and hot-reload. Nothing new is linked, so it should hold, but it is unconfirmed.
+2. ~~Re-measure the daemon's real footprint.~~ Done: **4.9 MB** `phys_footprint` after
+   8 minutes installed, 0.1% CPU. Against 2.9 MB at start / 4.5 MB steady from the
+   original v2 measurement — so the steady figure held and the table above stands.
 3. Add idle quit + pause.
 4. Log rotation, and evict `identities` for pids that leave the watchlist.
 5. Run with `dryRun: true` for a week. Read the Activity tab. Ship only when it's boring.
@@ -182,6 +183,52 @@ untrusted, which looked like proof the permission was fine. It was not: TCC attr
 a request to the **responsible process**, and for a binary exec'd from a shell that is
 the terminal. The test was reading the terminal's grant. Judge the daemon only by
 `axTrusted` in `status.json`, never by running the binary by hand.
+
+## Working during a dry-run observation window
+
+The two binaries being independent turns out to be a scheduling property as well as a
+memory one. While the daemon is under observation:
+
+- **Do not touch the daemon.** Changing the engine mid-evaluation invalidates the
+  evaluation, and a restart wipes the in-memory guard state — every app has to
+  re-earn `trustworthy`.
+- **The settings app is free to change.** `./build.sh settings` rebuilds only that
+  bundle, so a running daemon is never replaced or restarted. Verified: same pid,
+  uninterrupted uptime, across repeated settings builds.
+- **Config edits are free too.** They hot-reload, so fixing exclusions costs the
+  observation nothing.
+
+This is why the Activity summary was built before idle quit and pause, which are
+daemon changes and belong in one batch after the window closes.
+
+## The settings window can clobber the config
+
+Found the hard way, twice: the window held a `Config` loaded at launch and wrote the
+whole struct back on any change. A window left open overnight therefore wrote its
+stale copy over a file that had been corrected in the meantime, silently restoring
+the exclusion list that had just been removed. SwiftUI makes this worse than it
+sounds — a `Binding`'s `set` can fire during a re-render with the value it already
+has, so a passive redraw becomes a full config write.
+
+Two fixes, both required:
+
+1. **Every mutation is a read-modify-write.** `Model.mutate` re-reads the file first
+   (unless one of our own writes is already queued), applies just that edit, then
+   saves. An external edit can no longer be lost to a stale snapshot.
+2. **Guarded setters.** `setDryRun`, `setVerbose`, `setPollInterval`,
+   `setZeroReadings`, `setMode` and `setManaged` all return early when the value has
+   not actually changed, so a redraw cannot write anything at all.
+
+No view writes `cfg` directly any more; `scheduleSave` is private.
+
+## Colour: semantic, not accent
+
+The design mocks used blue for the "recommended" wash, the timing callout and the
+"matched by rule" pill. Implemented literally as `accentColor` those follow the user's
+system accent — and on a machine with a red accent an informational box reads as an
+error. Status surfaces now use fixed semantic colours (blue for information, orange
+for warning, green/red/yellow/orange/grey for the footer states). `accentColor` is
+left to selection and primary actions, where the system already uses it.
 
 ## Notes on SmartClose
 

@@ -16,6 +16,18 @@ if [ -z "$IDENTITY" ] && security find-identity -v -p codesigning 2>/dev/null \
     IDENTITY="CloseQuit Local"
 fi
 
+# Which target to build. The settings app and the daemon are independent binaries, and
+# during a dry-run observation window you want to iterate on the UI *without* replacing
+# the bundle a running daemon is paged in from.
+#   ./build.sh            both
+#   ./build.sh settings   settings app only
+#   ./build.sh daemon     daemon only
+TARGET="${1:-both}"
+case "$TARGET" in
+    both|daemon|settings) ;;
+    *) echo "usage: $0 [both|daemon|settings]" >&2; exit 2 ;;
+esac
+
 sign() {
     if [ -n "$IDENTITY" ]; then
         codesign --force --sign "$IDENTITY" "$1"
@@ -25,6 +37,8 @@ sign() {
 }
 
 # ---------- daemon ----------
+
+if [ "$TARGET" = "both" ] || [ "$TARGET" = "daemon" ]; then
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
@@ -56,11 +70,15 @@ swiftc -O -o "$APP/Contents/MacOS/CloseQuit" \
 sign "$APP"
 echo "Built $APP"
 
+fi
+
 # ---------- settings ----------
 #
 # A separate app on purpose. It links SwiftUI and AppKit, which the daemon must
 # never do — but it only exists while its window is open, so it costs nothing the
 # rest of the time. The two never talk; they share config.json.
+
+if [ "$TARGET" = "both" ] || [ "$TARGET" = "settings" ]; then
 
 rm -rf "$SETTINGS"
 mkdir -p "$SETTINGS/Contents/MacOS"
@@ -90,7 +108,9 @@ swiftc -O -parse-as-library -o "$SETTINGS/Contents/MacOS/CloseQuitSettings" \
 sign "$SETTINGS"
 echo "Built $SETTINGS"
 
-if [ -z "$IDENTITY" ]; then
+fi
+
+if [ -z "$IDENTITY" ] && [ "$TARGET" != "settings" ]; then
     cat <<'WARN'
 
   Signed ad-hoc. macOS ties the Accessibility grant to the exact binary hash, so
